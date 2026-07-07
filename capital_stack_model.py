@@ -137,6 +137,191 @@ def wrap_economics(
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Wrap SOLVER — you give constraints, it returns the terms
+# --------------------------------------------------------------------------- #
+# The calculator above answers "are THESE terms good?". The solver answers
+# "what SHOULD the terms be?" — it sweeps price / rate / down payment, keeps
+# only clean-exit structures (wrap note >= payoff AND balloon covers payoff),
+# then maximizes monthly spread. It also says whether wrapping beats holding.
+
+def _clean_exit(price, down_pct, rate, payoff, u_rate, u_orig, u_term, u_elapsed,
+                wrap_amort_yrs, balloon_yrs):
+    """Run the wrap and return (is_clean_exit, WrapResult) for one combo."""
+    r = wrap_economics(
+        payoff=payoff, underlying_rate=u_rate, underlying_orig_amount=u_orig,
+        underlying_orig_term_yrs=u_term, underlying_months_elapsed=u_elapsed,
+        wrap_sale_price=price, down_payment=price * down_pct, wrap_rate=rate,
+        wrap_amort_yrs=wrap_amort_yrs, balloon_yrs=balloon_yrs,
+    )
+    clean = (r.wrap_note_balance >= payoff) and (r.balloon_shortfall_or_surplus >= 0)
+    return clean, r
+
+
+def _min_clean_price(down_pct, rate, ceiling, payoff, u_rate, u_orig, u_term,
+                     u_elapsed, wrap_amort_yrs, balloon_yrs):
+    """Lowest sale price that yields a clean exit at (down_pct, rate), or None
+    if even the realistic ceiling can't clear it. Both constraints rise
+    monotonically with price, so we binary-search."""
+    lo = payoff * 0.3
+    feasible_ceiling, _ = _clean_exit(ceiling, down_pct, rate, payoff, u_rate,
+                                      u_orig, u_term, u_elapsed, wrap_amort_yrs, balloon_yrs)
+    if not feasible_ceiling:
+        return None
+    hi = ceiling
+    for _ in range(44):
+        mid = (lo + hi) / 2
+        ok, _ = _clean_exit(mid, down_pct, rate, payoff, u_rate, u_orig, u_term,
+                            u_elapsed, wrap_amort_yrs, balloon_yrs)
+        if ok:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def solve_wrap(
+    payoff: float,
+    underlying_rate: float,
+    underlying_orig_amount: float,
+    underlying_orig_term_yrs: int,
+    underlying_months_elapsed: int,
+    current_value: float,
+    hold_monthly_cashflow: float,       # your monthly bleed today if you DON'T wrap (usually negative)
+    balloon_yrs: int = 5,
+    wrap_amort_yrs: int = 30,
+    # realistic terms-buyer profile (the recommended pick):
+    typical_down_pct: float = 0.10,
+    typical_rate: float = 0.09,
+    # how far above appraised value a terms buyer might realistically pay:
+    max_price_premium: float = 0.06,
+    # ranges for the "show me everything" frontier:
+    down_pct_grid=(0.05, 0.08, 0.10, 0.15),
+    rate_grid=(0.080, 0.090, 0.100, 0.110),
+) -> dict:
+    ceiling_price = current_value * (1 + max_price_premium)
+    common = dict(payoff=payoff, u_rate=underlying_rate, u_orig=underlying_orig_amount,
+                  u_term=underlying_orig_term_yrs, u_elapsed=underlying_months_elapsed,
+                  wrap_amort_yrs=wrap_amort_yrs, balloon_yrs=balloon_yrs)
+    term_m = balloon_yrs * 12
+
+    # ---- Recommendation: the feasible terms CLOSEST to a realistic buyer ----
+    # Prefer the typical profile; if being underwater breaks it, search the grid
+    # for the clean-exit combo that deviates least from typical (buyer-friendliest
+    # fix first). On an underwater wrap the usual fix is a SMALLER down payment,
+    # which keeps more balance in the note so it clears your payoff.
+    cand_downs = sorted(set(list(down_pct_grid) + [typical_down_pct]))
+    cand_rates = sorted(set(list(rate_grid) + [typical_rate]))
+    best_rec = None
+    for dp in cand_downs:
+        for rt in cand_rates:
+            mp = _min_clean_price(dp, rt, ceiling_price, **common)
+            if mp is None:
+                continue
+            deviation = abs(dp - typical_down_pct) * 4 + abs(rt - typical_rate) * 10
+            if best_rec is None or deviation < best_rec[0]:
+                best_rec = (deviation, dp, rt, mp)
+
+    feasible = best_rec is not None
+    recommendation = None
+    per_10k_spread = None
+    ceiling_spread = None
+    adjusted = False
+
+    if feasible:
+        _, rec_dp, rec_rate, floor_price = best_rec
+        adjusted = (abs(rec_dp - typical_down_pct) > 1e-9) or (abs(rec_rate - typical_rate) > 1e-9)
+        rec_price = min(-(-floor_price // 1000) * 1000, ceiling_price)  # round UP to $1k, cap at ceiling
+        _, r = _clean_exit(rec_price, rec_dp, rec_rate, **common)
+        _, r10 = _clean_exit(min(rec_price + 10_000, ceiling_price), rec_dp, rec_rate, **common)
+        per_10k_spread = round(r10.monthly_spread - r.monthly_spread, 2)
+        _, rc = _clean_exit(ceiling_price, rec_dp, rec_rate, **common)
+        ceiling_spread = round(rc.monthly_spread, 2)
+        recommendation = {
+            "sale_price": round(rec_price, 2),
+            "down_pct": rec_dp,
+            "down_payment": round(rec_price * rec_dp, 2),
+            "wrap_rate": rec_rate,
+            "monthly_spread": round(r.monthly_spread, 2),
+            "balloon_surplus": round(r.balloon_shortfall_or_surplus, 2),
+            "cash_at_close": round(rec_price * rec_dp, 2),
+            "adjusted_from_typical": adjusted,
+        }
+
+    # ---- The frontier: min clean-exit price across the whole grid ----
+    frontier = []
+    best = None
+    for dp in down_pct_grid:
+        for rt in rate_grid:
+            mp = _min_clean_price(dp, rt, ceiling_price, **common)
+            if mp is None:
+                frontier.append({"down_pct": dp, "wrap_rate": rt, "min_price": None,
+                                 "monthly_spread": None, "balloon_surplus": None,
+                                 "clean_exit": False})
+                continue
+            mp1k = min(-(-mp // 1000) * 1000, ceiling_price)
+            _, rr = _clean_exit(mp1k, dp, rt, **common)
+            row = {"down_pct": dp, "wrap_rate": rt, "min_price": round(mp1k, 2),
+                   "monthly_spread": round(rr.monthly_spread, 2),
+                   "balloon_surplus": round(rr.balloon_shortfall_or_surplus, 2),
+                   "clean_exit": True}
+            frontier.append(row)
+            if best is None or rr.monthly_spread > best["monthly_spread"]:
+                best = row
+
+    # ---- Worth-it: wrap vs. keep holding, over the balloon horizon ----
+    hold_total = hold_monthly_cashflow * term_m           # your bleed if you do nothing
+    if feasible:
+        wrap_total = (recommendation["cash_at_close"]
+                      + recommendation["monthly_spread"] * term_m
+                      + recommendation["balloon_surplus"])
+        swing = wrap_total - hold_total
+        thin = recommendation["monthly_spread"] < 150
+        verdict = (
+            f"Wrap it. Ask ${recommendation['sale_price']:,.0f} at "
+            f"{recommendation['wrap_rate']*100:.1f}% with {recommendation['down_pct']*100:.0f}% down "
+            f"(${recommendation['down_payment']:,.0f} at close). Clean exit, "
+            f"${recommendation['monthly_spread']:,.0f}/mo spread. "
+            f"Versus holding (${hold_total:,.0f} over {balloon_yrs} yrs), "
+            f"that's about a ${swing:,.0f} swing in your favor."
+        )
+        if adjusted:
+            verdict += (
+                f" Note: a standard {typical_down_pct*100:.0f}% down at "
+                f"{typical_rate*100:.1f}% wouldn't clear your payoff because you're underwater — "
+                f"the {recommendation['down_pct']*100:.0f}% down keeps enough balance in the note "
+                "to wrap what you still owe. Counterintuitive, but that's the underwater math."
+            )
+        if thin:
+            verdict += " Spread is thin, so the real win is stopping the bleed and getting out, not the monthly income."
+    else:
+        wrap_total = None
+        swing = None
+        verdict = (
+            f"Don't wrap — at least not on these numbers. No clean-exit structure "
+            f"clears your ${payoff:,.0f} payoff even at a realistic price ceiling of "
+            f"${ceiling_price:,.0f} (value +{max_price_premium*100:.0f}%). You're too far "
+            f"underwater to wrap into a covered balloon. Hold and let equity rebuild, "
+            f"pursue mid-term furnished, or wait for the value/rate picture to improve."
+        )
+
+    return {
+        "feasible": feasible,
+        "realistic_ceiling_price": round(ceiling_price, 2),
+        "recommendation": recommendation,
+        "spread_per_10k_higher_price": per_10k_spread,
+        "spread_at_ceiling_price": ceiling_spread,
+        "best_spread_combo": best,
+        "frontier": frontier,
+        "worth_it": {
+            "hold_total_over_term": round(hold_total, 2),
+            "wrap_total_over_term": round(wrap_total, 2) if wrap_total is not None else None,
+            "swing": round(swing, 2) if swing is not None else None,
+            "verdict": verdict,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 2. Investor capital stack
 # --------------------------------------------------------------------------- #
 
