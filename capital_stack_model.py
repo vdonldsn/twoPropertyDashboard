@@ -412,7 +412,113 @@ def investor_returns(
 
 
 # --------------------------------------------------------------------------- #
-# 3. Depreciation shield (rough, first-year)
+# 3. Mid-term furnished SOLVER — works backward to the rent you'd need
+# --------------------------------------------------------------------------- #
+# You give the carrying cost and the furnished operating reality; it solves for
+# the monthly rent required to hit each of three thresholds, shows furnishing
+# both amortized and sunk, and judges each required rent against real market
+# rates (a comp you enter, or a benchmark range).
+
+def solve_midterm(
+    monthly_payment_piti: float,
+    monthly_hoa: float = 0.0,
+    # furnished operating reality:
+    utilities: float = 350.0,          # landlord-paid, all-inclusive
+    internet: float = 75.0,
+    cleaning_monthly: float = 60.0,    # turnover cleaning, spread monthly
+    occupancy: float = 0.85,           # effective, after gap days between contracts
+    mgmt_pct: float = 0.10,            # co-host share of collected rent (0 if self-managed)
+    maint_pct: float = 0.05,           # maintenance + capex reserve, % of collected
+    # furnishing:
+    furnishing_cost: float = 12_000.0,
+    furnishing_payback_months: int = 24,
+    # thresholds:
+    profit_target: float = 300.0,      # your desired monthly profit
+    # realism yardsticks:
+    market_comp: float = 0.0,          # a furnished rate YOU found (0 = none)
+    benchmark_low: float = 3_200.0,    # area furnished range (suburban 3bd)
+    benchmark_high: float = 4_200.0,
+) -> dict:
+    # Fixed monthly costs that don't scale with revenue:
+    fixed = utilities + internet + monthly_hoa + cleaning_monthly + monthly_payment_piti
+    # Revenue efficiency: fraction of asking rent that survives occupancy + %-of-rev costs
+    eff = occupancy * (1 - mgmt_pct - maint_pct)
+
+    def required_rent(target):
+        return (target + fixed) / eff if eff > 0 else float("inf")
+
+    furnishing_monthly = furnishing_cost / furnishing_payback_months if furnishing_payback_months else 0.0
+
+    # Three thresholds, each shown both ways (furnishing sunk vs amortized):
+    thresholds = {
+        "stop_the_bleed":        {"sunk": required_rent(0.0),
+                                  "amortized": required_rent(furnishing_monthly)},
+        "cover_target_profit":   {"sunk": required_rent(profit_target),
+                                  "amortized": required_rent(profit_target + furnishing_monthly)},
+    }
+    # (break-even + furnishing payback == stop_the_bleed "amortized")
+
+    # Realism: pick the yardstick and label each required rent
+    yardstick = market_comp if market_comp > 0 else benchmark_high
+
+    def realism(req):
+        if req <= benchmark_low:
+            return "comfortably within market"
+        if req <= benchmark_high:
+            return "achievable at the top of the market"
+        return "above realistic market"
+
+    # What actually happens at an achievable rent (the yardstick):
+    collected = yardstick * occupancy
+    surplus_at_yardstick = collected * (1 - mgmt_pct - maint_pct) - fixed  # furnishing sunk
+    months_to_recoup = (furnishing_cost / surplus_at_yardstick
+                        if surplus_at_yardstick > 0 else None)
+
+    # Plain-English verdict driven by the break-even number
+    be = thresholds["stop_the_bleed"]["sunk"]
+    src = f"your comp of ${market_comp:,.0f}" if market_comp > 0 else f"the ${benchmark_high:,.0f} top of market"
+    if be <= benchmark_low:
+        verdict = (f"Works. To stop the bleed you need ${be:,.0f}/mo furnished — inside the "
+                   f"${benchmark_low:,.0f}–${benchmark_high:,.0f} market range, so there's room above it "
+                   f"for profit. Mid-term is a real play here.")
+    elif be <= yardstick:
+        verdict = (f"Works, but tight. Break-even needs ${be:,.0f}/mo furnished, which you only clear "
+                   f"at {src}. It pencils if you self-manage and stay near full occupancy — thin margin otherwise.")
+    else:
+        verdict = (f"Doesn't pencil as-is. Break-even needs ${be:,.0f}/mo furnished, above {src}. "
+                   f"The carry (mortgage + HOA + landlord-paid utilities) is too heavy for the furnished "
+                   f"rate this submarket supports. Drop the co-host, push occupancy, or it's not the move.")
+
+    return {
+        "fixed_monthly_costs": round(fixed, 2),
+        "revenue_efficiency": round(eff, 4),
+        "furnishing_monthly": round(furnishing_monthly, 2),
+        "required_rent": {
+            "stop_the_bleed_sunk": round(thresholds["stop_the_bleed"]["sunk"], 2),
+            "stop_the_bleed_plus_furnishing": round(thresholds["stop_the_bleed"]["amortized"], 2),
+            "target_profit_sunk": round(thresholds["cover_target_profit"]["sunk"], 2),
+            "target_profit_plus_furnishing": round(thresholds["cover_target_profit"]["amortized"], 2),
+        },
+        "realism": {
+            "stop_the_bleed": realism(thresholds["stop_the_bleed"]["sunk"]),
+            "stop_the_bleed_plus_furnishing": realism(thresholds["stop_the_bleed"]["amortized"]),
+            "target_profit": realism(thresholds["cover_target_profit"]["sunk"]),
+            "benchmark_low": benchmark_low,
+            "benchmark_high": benchmark_high,
+            "yardstick": yardstick,
+        },
+        "at_yardstick_rent": {
+            "rent": round(yardstick, 2),
+            "monthly_surplus": round(surplus_at_yardstick, 2),
+            "months_to_recoup_furnishing": (round(months_to_recoup, 1)
+                                            if months_to_recoup is not None else None),
+        },
+        "verdict": verdict,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 4. Depreciation shield (rough, first-year)
 # --------------------------------------------------------------------------- #
 
 def depreciation_shield(

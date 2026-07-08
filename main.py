@@ -169,3 +169,25 @@ def investor(req: InvestorReq):
 @app.post("/depreciation")
 def depreciation(req: DepreciationReq):
     return csm.depreciation_shield(**req.model_dump())
+
+
+class MidtermReq(BaseModel):
+    monthly_payment_piti: float
+    monthly_hoa: float = 0.0
+    utilities: float = 350.0
+    internet: float = 75.0
+    cleaning_monthly: float = 60.0
+    occupancy: float = 0.85
+    mgmt_pct: float = 0.10
+    maint_pct: float = 0.05
+    furnishing_cost: float = 12_000.0
+    furnishing_payback_months: int = 24
+    profit_target: float = 300.0
+    market_comp: float = 0.0
+    benchmark_low: float = 3_200.0
+    benchmark_high: float = 4_200.0
+
+
+@app.post("/solve-midterm")
+def solve_midterm(req: MidtermReq):
+    return csm.solve_midterm(**req.model_dump())
