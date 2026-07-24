@@ -322,6 +322,119 @@ def solve_wrap(
 
 
 # --------------------------------------------------------------------------- #
+# 1c. Target-cash wrap solver — "I need $X at close, what terms get me there?"
+# --------------------------------------------------------------------------- #
+# solve_wrap() minimizes price (right when you're UNDERWATER and just need to
+# clear the payoff). This one is for POSITIVE equity: you name the cash you need
+# at closing, and it finds the clean-exit terms that maximize your total take
+# over the balloon term — cash at close + net spread + balloon surplus — while
+# landing the down payment inside your target band.
+
+def solve_wrap_for_cash(
+    payoff: float,
+    underlying_rate: float,
+    underlying_orig_amount: float,
+    underlying_orig_term_yrs: int,
+    underlying_months_elapsed: int,
+    current_value: float,
+    target_cash_min: float,
+    target_cash_max: float,
+    escrow_monthly: float = 0.0,        # T&I you still owe on the underlying
+    buyer_pays_escrow: bool = True,     # does the buyer reimburse it?
+    balloon_yrs: int = 5,
+    wrap_amort_yrs: int = 30,
+    max_price_premium: float = 0.08,    # highest ask above value a buyer accepts
+    min_price_discount: float = 0.02,   # lowest ask below value you'd accept
+    rate_grid=(0.080, 0.085, 0.090, 0.095, 0.100, 0.105),
+    down_pct_grid=(0.05, 0.06, 0.07, 0.08, 0.10, 0.12),
+    price_step: float = 5_000.0,
+) -> dict:
+    term_m = balloon_yrs * 12
+    seller_pi = monthly_pi(underlying_orig_amount, underlying_rate, underlying_orig_term_yrs)
+    und_bal_balloon = balance_after(underlying_orig_amount, underlying_rate,
+                                    underlying_orig_term_yrs,
+                                    underlying_months_elapsed + term_m)
+
+    lo_price = current_value * (1 - min_price_discount)
+    hi_price = current_value * (1 + max_price_premium)
+    prices = []
+    p = (lo_price // price_step) * price_step
+    while p <= hi_price + 1:
+        if p >= lo_price - 1:
+            prices.append(p)
+        p += price_step
+
+    combos = []
+    for price in prices:
+        for dp in down_pct_grid:
+            cash = price * dp
+            if not (target_cash_min <= cash <= target_cash_max):
+                continue
+            note = price - cash
+            if note < payoff:                      # must clear what you owe
+                continue
+            for rt in rate_grid:
+                buyer_pi = monthly_pi(note, rt, wrap_amort_yrs)
+                spread = buyer_pi - seller_pi
+                net_spread = spread if buyer_pays_escrow else spread - escrow_monthly
+                wrap_bal = balance_after(note, rt, wrap_amort_yrs, term_m)
+                balloon = wrap_bal - und_bal_balloon
+                if balloon < 0:                    # balloon must cover your payoff
+                    continue
+                total = cash + net_spread * term_m + balloon
+                combos.append({
+                    "sale_price": round(price, 2),
+                    "down_pct": round(dp, 4),
+                    "cash_at_close": round(cash, 2),
+                    "wrap_rate": rt,
+                    "wrap_note": round(note, 2),
+                    "buyer_pi": round(buyer_pi, 2),
+                    "buyer_all_in": round(buyer_pi + (escrow_monthly if buyer_pays_escrow else 0), 2),
+                    "gross_spread": round(spread, 2),
+                    "net_spread": round(net_spread, 2),
+                    "spread_over_term": round(net_spread * term_m, 2),
+                    "balloon_surplus": round(balloon, 2),
+                    "total_5yr": round(total, 2),
+                })
+
+    combos.sort(key=lambda c: c["total_5yr"], reverse=True)
+    best = combos[0] if combos else None
+    sale_net = current_value * 0.92 - payoff       # sell outright, 8% costs
+
+    if best is None:
+        verdict = (f"No clean-exit structure delivers ${target_cash_min:,.0f}–${target_cash_max:,.0f} "
+                   f"at close within a ${lo_price:,.0f}–${hi_price:,.0f} price range. Widen the price "
+                   f"ceiling, lower the cash target, or the equity isn't there yet.")
+        escrow_cost = None
+    else:
+        escrow_cost = round(escrow_monthly * term_m, 2)
+        verdict = (
+            f"Ask ${best['sale_price']:,.0f} at {best['wrap_rate']*100:.1f}% with "
+            f"{best['down_pct']*100:.0f}% down — ${best['cash_at_close']:,.0f} in your pocket at close. "
+            f"Buyer's all-in payment ${best['buyer_all_in']:,.0f}/mo, your net spread "
+            f"${best['net_spread']:,.0f}/mo, balloon surplus ${best['balloon_surplus']:,.0f}. "
+            f"Five-year total ${best['total_5yr']:,.0f} vs. ${sale_net:,.0f} selling outright today."
+        )
+        if not buyer_pays_escrow:
+            verdict += (f" Note: you're absorbing ${escrow_monthly:,.0f}/mo of escrow — "
+                        f"${escrow_cost:,.0f} over the term. Get the buyer to reimburse T&I and "
+                        f"that goes straight to your bottom line.")
+
+    return {
+        "feasible": best is not None,
+        "price_range_tested": [round(lo_price, 2), round(hi_price, 2)],
+        "seller_underlying_pi": round(seller_pi, 2),
+        "escrow_monthly": round(escrow_monthly, 2),
+        "escrow_cost_over_term": escrow_cost,
+        "buyer_pays_escrow": buyer_pays_escrow,
+        "best": best,
+        "alternatives": combos[1:6],
+        "sell_outright_net": round(sale_net, 2),
+        "verdict": verdict,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 2. Investor capital stack
 # --------------------------------------------------------------------------- #
 

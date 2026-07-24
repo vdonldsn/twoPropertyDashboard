@@ -161,6 +161,28 @@ def solve_wrap(req: SolveWrapReq):
     return csm.solve_wrap(**req.model_dump())
 
 
+class WrapCashReq(BaseModel):
+    payoff: float
+    underlying_rate: float
+    underlying_orig_amount: float
+    underlying_orig_term_yrs: int = 30
+    underlying_months_elapsed: int = 0
+    current_value: float
+    target_cash_min: float
+    target_cash_max: float
+    escrow_monthly: float = 0.0
+    buyer_pays_escrow: bool = True
+    balloon_yrs: int = 5
+    wrap_amort_yrs: int = 30
+    max_price_premium: float = 0.08
+    min_price_discount: float = 0.02
+
+
+@app.post("/solve-wrap-cash")
+def solve_wrap_cash(req: WrapCashReq):
+    return csm.solve_wrap_for_cash(**req.model_dump())
+
+
 @app.post("/investor")
 def investor(req: InvestorReq):
     return asdict(csm.investor_returns(**req.model_dump()))
